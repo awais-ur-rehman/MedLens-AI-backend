@@ -1,7 +1,9 @@
 """MedLens AI - FastAPI Backend Entry Point."""
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.websocket_handler import handle_session
 
 app = FastAPI(
     title="MedLens AI",
@@ -28,13 +30,5 @@ async def health_check():
 @app.websocket("/ws/session")
 async def websocket_session(websocket: WebSocket):
     """WebSocket endpoint for real-time AI session communication."""
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_text()
-            # TODO: Route messages to the MedLens agent
-            await websocket.send_json(
-                {"type": "info", "message": "Session active — agent not yet connected."}
-            )
-    except WebSocketDisconnect:
-        pass
+    await handle_session(websocket)
+
