@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+websockets
+google-cloud-aiplatform
+google-genai
+google-adk
+google-cloud-discoveryengine
+google-cloud-storage
+google-cloud-secret-manager
+pydantic
+pydantic-settings
+python-dotenv
+Pillow
+numpy
