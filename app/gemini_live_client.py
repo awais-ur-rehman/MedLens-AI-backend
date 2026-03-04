@@ -42,6 +42,30 @@ class GeminiLiveClient:
 
     async def connect(self) -> None:
         """Open a Live API session with the Dr. Muhammad persona."""
+        request_camera_decl = types.FunctionDeclaration(
+            name="request_camera",
+            description="Allows Dr. Muhammad to ask the user to open the camera to take a photo of their injury.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "prompt": {"type": "STRING", "description": "The prompt or reason to show the user (e.g. 'Show me the affected area')."}
+                },
+                "required": ["prompt"],
+            }
+        )
+        request_live_camera_decl = types.FunctionDeclaration(
+            name="request_live_camera",
+            description="Allows Dr. Muhammad to ask the user to hold the camera steady for a live video feed.",
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "prompt": {"type": "STRING", "description": "The prompt to show the user."},
+                    "duration_seconds": {"type": "INTEGER", "description": "The duration of the live feed in seconds (recommended: 10)."}
+                },
+                "required": ["prompt", "duration_seconds"],
+            }
+        )
+
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
@@ -55,7 +79,10 @@ class GeminiLiveClient:
             output_audio_transcription=types.AudioTranscriptionConfig(),
             input_audio_transcription=types.AudioTranscriptionConfig(),
             system_instruction=DR_MUHAMMAD_PROMPT,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+            tools=[types.Tool(
+                google_search=types.GoogleSearch(),
+                function_declarations=[request_camera_decl, request_live_camera_decl],
+            )],
         )
 
         self._session_ctx = self._client.aio.live.connect(
@@ -166,6 +193,11 @@ class GeminiLiveClient:
                         fn_call = getattr(part, "function_call", None)
                         if fn_call:
                             yield {"type": "tool_call", "data": fn_call}
+
+                # --- Turn Complete ---
+                turn_complete = getattr(server_content, "turn_complete", None)
+                if turn_complete:
+                    yield {"type": "turn_complete", "speaker": "agent"}
 
     # ------------------------------------------------------------------
     # Tool response

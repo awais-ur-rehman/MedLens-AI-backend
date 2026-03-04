@@ -41,6 +41,13 @@ from app.tools.search_tool import GoogleSearchGroundingParser
 
 logger = logging.getLogger(__name__)
 
+try:
+    from app.agents import AgentPipeline
+    _AGENTS_AVAILABLE = True
+except Exception:
+    _AGENTS_AVAILABLE = False
+    logger.warning("AgentPipeline not available — using fallback care summary")
+
 # ---------------------------------------------------------------------------
 # Safety keywords — if any appear in the model's text output the client UI
 # should highlight them (we tag the message so Flutter can style it).
@@ -71,6 +78,7 @@ async def _forward_gemini_to_client(
     gemini: GeminiLiveClient,
     ws: WebSocket,
     transcript_parts: list[str],
+    pipeline: Any | None = None,
 ) -> None:
     """Background task: read from Gemini and push to the Flutter client.
 
@@ -88,6 +96,8 @@ async def _forward_gemini_to_client(
             elif chunk_type == "text":
                 text = chunk["text"]
                 transcript_parts.append(text)
+                if pipeline is not None:
+                    pipeline.add_transcript("agent", text)
 
                 payload: dict[str, Any] = {
                     "type": "transcript",
@@ -116,9 +126,18 @@ async def _forward_gemini_to_client(
             elif chunk_type == "user_text":
                 text = chunk["text"]
                 transcript_parts.append("[User] " + text)
+                if pipeline is not None:
+                    pipeline.add_transcript("user", text)
                 await ws.send_json({
                     "type": "user_transcript",
                     "text": text,
+                })
+
+            # ---- Turn Complete ---------------------------------------------
+            elif chunk_type == "turn_complete":
+                await ws.send_json({
+                    "type": "turn_complete",
+                    "speaker": chunk.get("speaker", "agent")
                 })
 
             # ---- Tool call → handle internally, respond to Gemini ----------
@@ -127,16 +146,46 @@ async def _forward_gemini_to_client(
                 tool_name = getattr(fn_call, "name", str(fn_call))
                 logger.info("Tool call received: %s", tool_name)
 
-                # Notify Flutter that the agent is thinking
-                await ws.send_json({
-                    "type": "agent_thinking",
-                    "tool": tool_name,
-                })
+                if tool_name in ["request_camera", "request_live_camera"]:
+                    logger.info("Forwarding %s request to Flutter", tool_name)
+                    
+                    # Extract args safely (depends on genai SDK structure, usually it's a dict or object)
+                    args = getattr(fn_call, "args", {})
+                    if hasattr(args, "get"):
+                        prompt = args.get("prompt", "Show me.")
+                        duration = args.get("duration_seconds", 10)
+                    else:
+                        prompt = getattr(args, "prompt", "Show me.")
+                        duration = getattr(args, "duration_seconds", 10)
+                    
+                    payload = {
+                        "type": tool_name,
+                        "prompt": prompt,
+                    }
+                    if tool_name == "request_live_camera":
+                        payload["duration_seconds"] = duration
+                        
+                    await ws.send_json(payload)
+                    
+                    # Respond to Gemini immediately so it can continue 
+                    # (it will wait for user to send the image frame later)
+                    from google.genai import types
+                    await gemini.send_tool_response([
+                        types.FunctionResponse(
+                            name=tool_name,
+                            id=getattr(fn_call, "id", ""),
+                            response={"result": "Request sent to user's device. Waiting for user to send image/video."},
+                        )
+                    ])
+                else:
+                    # Notify Flutter that the agent is thinking (e.g. for Google Search)
+                    await ws.send_json({
+                        "type": "agent_thinking",
+                        "tool": tool_name,
+                    })
 
                 # Google Search grounding is handled automatically by the
-                # Live API — no manual tool response needed.  If custom tools
-                # are added later, dispatch them here and call
-                # gemini.send_tool_response([...]).
+                # Live API — no manual tool response needed.
 
     except asyncio.CancelledError:
         logger.debug("Gemini forwarding task cancelled")
@@ -181,6 +230,7 @@ async def handle_session(websocket: WebSocket) -> None:
     gemini: GeminiLiveClient | None = None
     forward_task: asyncio.Task | None = None
     transcript_parts: list[str] = []
+    pipeline: "AgentPipeline | None" = None
 
     try:
         while True:
@@ -220,10 +270,12 @@ async def handle_session(websocket: WebSocket) -> None:
                     gemini = GeminiLiveClient(settings)
                     await gemini.connect()
                     transcript_parts.clear()
+                    if _AGENTS_AVAILABLE:
+                        pipeline = AgentPipeline()
 
                     # Kick off background forwarding Gemini → Client
                     forward_task = asyncio.create_task(
-                        _forward_gemini_to_client(gemini, websocket, transcript_parts)
+                        _forward_gemini_to_client(gemini, websocket, transcript_parts, pipeline)
                     )
 
                     await websocket.send_json({"type": "session_started"})
@@ -238,7 +290,14 @@ async def handle_session(websocket: WebSocket) -> None:
 
             # ── end_session ───────────────────────────────────────────────
             elif msg_type == "end_session":
-                summary = _build_care_summary(transcript_parts)
+                if _AGENTS_AVAILABLE and pipeline is not None:
+                    try:
+                        summary = await pipeline.generate_summary()
+                    except Exception:
+                        logger.exception("AgentPipeline summary failed — using fallback")
+                        summary = _build_care_summary(transcript_parts)
+                else:
+                    summary = _build_care_summary(transcript_parts)
                 await websocket.send_json({"type": "care_summary", "data": summary})
 
                 if forward_task and not forward_task.done():
@@ -253,6 +312,7 @@ async def handle_session(websocket: WebSocket) -> None:
                     gemini = None
 
                 forward_task = None
+                pipeline = None
                 transcript_parts.clear()
 
                 await websocket.send_json({"type": "session_ended"})
