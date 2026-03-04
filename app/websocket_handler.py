@@ -37,6 +37,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from app.config import settings
 from app.gemini_live_client import GeminiLiveClient
+from app.tools.search_tool import GoogleSearchGroundingParser
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +98,32 @@ async def _forward_gemini_to_client(
 
                 await ws.send_json(payload)
 
+                # -- Forward Google Search grounding citations ---------------
+                grounding_meta = chunk.get("grounding_metadata")
+                if grounding_meta and GoogleSearchGroundingParser.has_grounding(
+                    grounding_meta
+                ):
+                    citations = GoogleSearchGroundingParser.extract_citations(
+                        grounding_meta
+                    )
+                    if citations:
+                        await ws.send_json({
+                            "type": "citation",
+                            "sources": citations,
+                        })
+
             # ---- Tool call → handle internally, respond to Gemini ----------
             elif chunk_type == "tool_call":
                 fn_call = chunk["data"]
-                logger.info("Tool call received: %s", getattr(fn_call, "name", fn_call))
+                tool_name = getattr(fn_call, "name", str(fn_call))
+                logger.info("Tool call received: %s", tool_name)
+
+                # Notify Flutter that the agent is thinking
+                await ws.send_json({
+                    "type": "agent_thinking",
+                    "tool": tool_name,
+                })
+
                 # Google Search grounding is handled automatically by the
                 # Live API — no manual tool response needed.  If custom tools
                 # are added later, dispatch them here and call

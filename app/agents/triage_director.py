@@ -1,39 +1,46 @@
 """Triage Director — root agent that orchestrates the Dr. Muhammad system."""
 
-from google.adk.agents import LlmAgent
-from google.adk.tools import google_search
+from __future__ import annotations
 
-from app.agents.visual_assessor import create_visual_assessor
-from app.agents.protocol_advisor import create_protocol_advisor
+from google.adk.agents import LlmAgent
+from google.adk.tools import AgentTool
+
 from app.config import settings
 from app.prompts import DR_MUHAMMAD_PROMPT
-from app.tools.search import search_medical_knowledge
+from app.tools.rag_tool import search_first_aid_protocols
+from app.tools.maps_tool import find_nearest_emergency_services
 
 TRIAGE_DIRECTOR_INSTRUCTION = f"""\
 {DR_MUHAMMAD_PROMPT}
 
 ## AGENT DELEGATION
 
-You have access to specialist sub-agents. Use them appropriately:
+You have access to specialist sub-agents and tools. Use them appropriately:
 
-### visual_assessor
+### visual_assessor (Agent)
 Call when the user shares a camera image or asks you to look at their injury.
 This agent returns a structured JSON assessment with injury type, severity,
 body location, and overlay coordinates.
 
-### protocol_advisor
+### protocol_advisor (Agent)
 Call AFTER visual assessment (or when the injury type is known) to retrieve
 the evidence-based first-aid protocol from the MedLens knowledge base.
 
-### google_search
-Use for real-time information such as:
+### search_first_aid_protocols (Tool)
+Use to search the MedLens first-aid document corpus directly when you need
+protocol information without a full visual assessment first.
+
+### find_nearest_emergency_services (Tool)
+Use when the user asks about nearby hospitals or emergency rooms, or when
+the injury severity warrants professional medical attention.
+
+### Google Search (Built-in)
+Google Search grounding is enabled in the Live API config. The model will
+automatically use it for real-time information such as:
 - Drug interactions or contraindications
 - Local emergency numbers
 - Current medical guidelines
 - Information not in the MedLens knowledge base
-
-### search_medical_knowledge
-Use to search the MedLens first-aid document corpus directly.
 
 ## WORKFLOW
 1. User describes or shows their injury
@@ -44,11 +51,16 @@ Use to search the MedLens first-aid document corpus directly.
 """
 
 
-def create_triage_director() -> LlmAgent:
-    """Create the root Triage Director agent (Dr. Muhammad)."""
-    visual_assessor = create_visual_assessor()
-    protocol_advisor = create_protocol_advisor()
+def create_triage_director(
+    visual_assessor: LlmAgent,
+    protocol_advisor: LlmAgent,
+) -> LlmAgent:
+    """Create the root Triage Director agent (Dr. Muhammad).
 
+    Args:
+        visual_assessor: Pre-created Visual Assessor agent instance.
+        protocol_advisor: Pre-created Protocol Advisor agent instance.
+    """
     return LlmAgent(
         name="triage_director",
         model=settings.gemini_flash_model,
@@ -59,11 +71,9 @@ def create_triage_director() -> LlmAgent:
         ),
         instruction=TRIAGE_DIRECTOR_INSTRUCTION,
         tools=[
-            google_search,
-            search_medical_knowledge,
-        ],
-        sub_agents=[
-            visual_assessor,
-            protocol_advisor,
+            AgentTool(agent=visual_assessor),
+            AgentTool(agent=protocol_advisor),
+            search_first_aid_protocols,
+            find_nearest_emergency_services,
         ],
     )

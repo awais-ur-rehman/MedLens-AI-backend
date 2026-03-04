@@ -15,10 +15,13 @@ from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.runners import InMemoryRunner
 from google.genai import types
 
+from app.agents.visual_assessor import create_visual_assessor
+from app.agents.protocol_advisor import create_protocol_advisor
 from app.agents.triage_director import create_triage_director
 from app.agents.safety_guardian import create_safety_guardian
 from app.agents.summary_generator import create_summary_generator
 from app.config import settings
+from app.tools.rag_tool import RAGTool
 
 logger = logging.getLogger(__name__)
 
@@ -27,19 +30,34 @@ class AgentPipeline:
     """Orchestrator for the MedLens multi-agent system.
 
     Creates and manages the lifecycle of:
-    - Triage Director (root) with Visual Assessor + Protocol Advisor sub-agents
+    - Triage Director (root) with Visual Assessor + Protocol Advisor as AgentTools
     - Safety Guardian (parallel filter)
     - Summary Generator (sequential pipeline)
+    - RAG Tool instance for direct knowledge-base access
 
     Also maintains ``session_context`` — a running log of all assessments,
     protocols, medications, and transcript entries gathered during a session.
     """
 
     def __init__(self) -> None:
+        # ---- RAG tool ----
+        self.rag_tool = RAGTool(
+            project_id=settings.google_cloud_project or "medlens-489020",
+            engine_id=settings.vertex_search_app or "medlens-search-app",
+            location="global",
+        )
+
         # ---- Create agents ----
-        self.triage_director: LlmAgent = create_triage_director()
+        self.visual_assessor: LlmAgent = create_visual_assessor()
+        self.protocol_advisor: LlmAgent = create_protocol_advisor()
         self.safety_guardian: LlmAgent = create_safety_guardian()
         self.summary_generator: SequentialAgent = create_summary_generator()
+
+        # Triage Director receives pre-created agents for AgentTool wrapping
+        self.triage_director: LlmAgent = create_triage_director(
+            visual_assessor=self.visual_assessor,
+            protocol_advisor=self.protocol_advisor,
+        )
 
         # ---- Runners (in-memory for now) ----
         self.triage_runner = InMemoryRunner(
@@ -58,7 +76,7 @@ class AgentPipeline:
         # ---- Persistent session context ----
         self.session_context: dict[str, Any] = {
             "assessments": [],
-            "protocols": [],
+            "protocols_given": [],
             "medications": [],
             "transcript": [],
             "escalations": [],
@@ -69,13 +87,12 @@ class AgentPipeline:
     #  High-level actions
     # ------------------------------------------------------------------
 
-    async def assess_visual(self, frame_bytes: bytes) -> dict[str, Any]:
-        """Run the Visual Assessor → Protocol Advisor chain on a camera frame.
+    async def assess_visual(self, frame_bytes: bytes) -> dict[str, Any] | None:
+        """Run Visual Assessor → Protocol Advisor chain on a camera frame.
 
-        Returns the combined result dict with assessment and protocol.
+        Returns the combined result with assessment and grounded protocol,
+        or ``None`` if the assessment confidence is too low.
         """
-        b64_image = base64.b64encode(frame_bytes).decode("utf-8")
-
         # Build user content with the image
         user_content = types.Content(
             role="user",
@@ -112,13 +129,22 @@ class AgentPipeline:
                             except json.JSONDecodeError:
                                 result = {"raw_text": part.text}
 
-            # Track in session context
-            if result:
-                self.session_context["assessments"].append(result)
-
         except Exception as e:
             logger.error("Visual assessment failed: %s", e)
-            result = {"error": str(e)}
+            return {"error": str(e)}
+
+        # Only track high-confidence assessments
+        if not result or result.get("confidence", 0) < 0.6:
+            return None
+
+        self.session_context["assessments"].append(result)
+
+        # The triage director delegates to protocol_advisor via AgentTool,
+        # so the protocol is already included in the result.  If it ran
+        # the RAG tool, extract the protocol info.
+        protocol = result.get("protocol") or result.get("protocol_advice")
+        if protocol:
+            self.session_context["protocols_given"].append(protocol)
 
         return result
 
@@ -214,8 +240,9 @@ class AgentPipeline:
         This is called from the WebSocket handler when Gemini Live issues a
         tool_call that needs to be resolved server-side.
         """
-        handlers = {
-            "search_medical_knowledge": self._handle_search,
+        handlers: dict[str, Any] = {
+            "search_first_aid_protocols": self._handle_rag_search,
+            "find_nearest_emergency_services": self._handle_emergency_lookup,
             "assess_visual": self._handle_visual,
         }
 
@@ -249,15 +276,25 @@ class AgentPipeline:
     #  Private tool handlers
     # ------------------------------------------------------------------
 
-    async def _handle_search(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Handle a search_medical_knowledge tool call."""
-        from app.tools.search import search_medical_knowledge
+    async def _handle_rag_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Handle a search_first_aid_protocols tool call."""
+        from app.tools.rag_tool import search_first_aid_protocols
 
         query = args.get("query", "")
-        return search_medical_knowledge(query)
+        text_result = await search_first_aid_protocols(query)
+        return {"result": text_result}
+
+    async def _handle_emergency_lookup(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Handle a find_nearest_emergency_services tool call."""
+        from app.tools.maps_tool import find_nearest_emergency_services
+
+        location = args.get("location_description", "")
+        text_result = await find_nearest_emergency_services(location)
+        return {"result": text_result}
 
     async def _handle_visual(self, args: dict[str, Any]) -> dict[str, Any]:
         """Handle an assess_visual tool call."""
         image_b64 = args.get("image", "")
         frame_bytes = base64.b64decode(image_b64)
-        return await self.assess_visual(frame_bytes)
+        result = await self.assess_visual(frame_bytes)
+        return result or {"error": "Low confidence assessment"}
