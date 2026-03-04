@@ -43,7 +43,7 @@ class GeminiLiveClient:
     async def connect(self) -> None:
         """Open a Live API session with the Dr. Muhammad persona."""
         live_config = types.LiveConnectConfig(
-            response_modalities=["AUDIO", "TEXT"],
+            response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -51,6 +51,9 @@ class GeminiLiveClient:
                     )
                 )
             ),
+            # Transcribe both directions so we get text alongside audio
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
             system_instruction=DR_MUHAMMAD_PROMPT,
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
@@ -136,16 +139,27 @@ class GeminiLiveClient:
 
         async for message in self._session.receive():
             # --- Audio chunk ---
-            if message.data:
+            if getattr(message, "data", None):
                 yield {"type": "audio", "data": message.data}
 
-            # --- Text chunk ---
-            if message.text:
+            # --- Text chunk (if TEXT modality was used) ---
+            if getattr(message, "text", None):
                 yield {"type": "text", "text": message.text}
 
-            # --- Tool / function call ---
             server_content = getattr(message, "server_content", None)
             if server_content:
+                # --- Output Audio Transcription (Text representation of voice) ---
+                out_trans = getattr(server_content, "output_transcription", None)
+                if out_trans and out_trans.text:
+                    yield {"type": "text", "text": out_trans.text}
+
+                # --- Input Audio Transcription (Optional: what the user said) ---
+                inp_trans = getattr(server_content, "input_transcription", None)
+                if inp_trans and inp_trans.text:
+                    # We can yield this as user_text if UI wants to show what was heard
+                    yield {"type": "user_text", "text": inp_trans.text}
+
+                # --- Tool / function call ---
                 model_turn = getattr(server_content, "model_turn", None)
                 if model_turn and model_turn.parts:
                     for part in model_turn.parts:

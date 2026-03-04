@@ -112,6 +112,15 @@ async def _forward_gemini_to_client(
                             "sources": citations,
                         })
 
+            # ---- User Text → send as JSON ----------------------------------
+            elif chunk_type == "user_text":
+                text = chunk["text"]
+                transcript_parts.append("[User] " + text)
+                await ws.send_json({
+                    "type": "user_transcript",
+                    "text": text,
+                })
+
             # ---- Tool call → handle internally, respond to Gemini ----------
             elif chunk_type == "tool_call":
                 fn_call = chunk["data"]
