@@ -31,7 +31,11 @@ import asyncio
 import base64
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
+
+from google import genai
+from google.genai import types
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -201,17 +205,86 @@ async def _forward_gemini_to_client(
 # Session summary generator
 # ---------------------------------------------------------------------------
 
-def _build_care_summary(transcript_parts: list[str]) -> dict[str, Any]:
-    """Build a simple care summary from the collected transcript."""
-    full_text = " ".join(transcript_parts).strip()
-
+def _build_care_summary_fallback(transcript_parts: list[str]) -> dict[str, Any]:
+    """Minimal fallback summary when Gemini Flash is unavailable."""
     return {
-        "session_transcript": full_text,
-        "word_count": len(full_text.split()) if full_text else 0,
-        "had_escalation": _check_escalation(full_text),
-        # TODO: Use Gemini Flash to generate a structured care summary
-        #       with key findings, actions taken, and follow-up recommendations.
+        "session_id": "",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "injury_type": "First Aid Consultation",
+        "severity": "low",
+        "patient_description": " ".join(transcript_parts[:3]).strip() or "Session completed.",
+        "actions_taken": ["Please review the session transcript for details."],
+        "medications_discussed": [],
+        "follow_up_recommendations": ["Consult a healthcare provider if symptoms persist."],
+        "warning_signs": ["Seek emergency care if symptoms worsen."],
+        "disclaimer": (
+            "This was first aid guidance only. Dr. Muhammad is not a substitute for "
+            "professional medical care. If symptoms worsen or you are unsure, please "
+            "contact a healthcare provider or call emergency services."
+        ),
     }
+
+
+async def _generate_care_summary(transcript_parts: list[str]) -> dict[str, Any]:
+    """Generate a structured care summary using Gemini Flash.
+
+    Produces JSON that matches Flutter's CareSummaryModel.fromJson expectations.
+    Falls back gracefully if the model call fails.
+    """
+    full_transcript = " ".join(transcript_parts).strip()
+    if not full_transcript:
+        return _build_care_summary_fallback(transcript_parts)
+
+    prompt = f"""You are a medical records assistant for a first aid app called MedLens.
+A patient just completed a consultation with Dr. Muhammad, an AI first aid assistant.
+
+CONSULTATION TRANSCRIPT:
+{full_transcript}
+
+Generate a structured care summary as a JSON object. Return ONLY valid JSON — no markdown, no code fences, no explanation.
+
+Use exactly this structure:
+{{
+  "session_id": "",
+  "timestamp": "{datetime.now(timezone.utc).isoformat()}",
+  "injury_type": "One short phrase describing the injury (e.g. First-degree burn, Laceration, Sprained ankle)",
+  "severity": "low",
+  "patient_description": "One sentence describing what happened based on the transcript.",
+  "actions_taken": [
+    "First aid step 1 that was recommended",
+    "First aid step 2 that was recommended"
+  ],
+  "medications_discussed": [],
+  "follow_up_recommendations": [
+    "When to see a doctor",
+    "Any follow-up care needed"
+  ],
+  "warning_signs": [
+    "Symptom A that means seek immediate care",
+    "Symptom B that means seek immediate care"
+  ],
+  "disclaimer": "This was first aid guidance only. Dr. Muhammad is not a substitute for professional medical care. If symptoms worsen or you are unsure, please contact a healthcare provider or call emergency services."
+}}
+
+For severity: use "low" for minor cuts/burns/bruises, "medium" for moderate injuries requiring monitoring, "high" for serious injuries needing prompt medical attention."""
+
+    try:
+        client = genai.Client(
+            vertexai=True,
+            project=settings.google_cloud_project,
+            location=settings.google_cloud_location,
+        )
+        response = await client.aio.models.generate_content(
+            model=settings.gemini_flash_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
+        )
+        return json.loads(response.text)
+    except Exception:
+        logger.exception("Gemini Flash care summary failed — using fallback")
+        return _build_care_summary_fallback(transcript_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +354,11 @@ async def handle_session(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "session_started"})
                     logger.info("Gemini Live session started")
 
+                    # Trigger Dr. Muhammad's opening greeting.
+                    # The Live API waits for input before speaking — a single
+                    # dot is enough to prompt it to follow the system instruction.
+                    await gemini.trigger_greeting()
+
                 except Exception as exc:
                     logger.exception("Failed to start Gemini session")
                     await websocket.send_json(
@@ -290,14 +368,7 @@ async def handle_session(websocket: WebSocket) -> None:
 
             # ── end_session ───────────────────────────────────────────────
             elif msg_type == "end_session":
-                if _AGENTS_AVAILABLE and pipeline is not None:
-                    try:
-                        summary = await pipeline.generate_summary()
-                    except Exception:
-                        logger.exception("AgentPipeline summary failed — using fallback")
-                        summary = _build_care_summary(transcript_parts)
-                else:
-                    summary = _build_care_summary(transcript_parts)
+                summary = await _generate_care_summary(transcript_parts)
                 await websocket.send_json({"type": "care_summary", "data": summary})
 
                 if forward_task and not forward_task.done():
@@ -349,6 +420,13 @@ async def handle_session(websocket: WebSocket) -> None:
             elif msg_type == "barge_in":
                 if gemini and gemini.is_connected:
                     await gemini.send_barge_in()
+
+            # ── end_of_turn ───────────────────────────────────────────────
+            # Sent by Flutter when the user taps the mic button to explicitly
+            # finish their turn (fallback for when Gemini VAD is slow).
+            elif msg_type == "end_of_turn":
+                if gemini and gemini.is_connected:
+                    await gemini.send_end_of_turn()
 
             # ── unknown ──────────────────────────────────────────────────
             else:

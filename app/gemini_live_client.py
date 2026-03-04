@@ -149,6 +149,45 @@ class GeminiLiveClient:
             turn_complete=True,
         )
 
+    async def trigger_greeting(self) -> None:
+        """Send an initial trigger so Dr. Muhammad starts with a greeting.
+
+        Gemini Live doesn't auto-speak on connect — it waits for input.
+        Sending a single dot gives it the turn it needs to follow the
+        system prompt instruction to introduce itself.
+        """
+        if not self._session:
+            raise RuntimeError("Session not connected")
+        await self._session.send_client_content(
+            turns=types.Content(
+                role="user",
+                parts=[types.Part.from_text(".")],
+            ),
+            turn_complete=True,
+        )
+
+    async def send_end_of_turn(self) -> None:
+        """Signal that the user has finished speaking (manual VAD trigger).
+
+        Used when the user taps the mic button to explicitly send their
+        message rather than waiting for Gemini's built-in VAD to detect
+        the end of speech.
+        """
+        if not self._session:
+            raise RuntimeError("Session not connected")
+        try:
+            # Preferred: send an activity-end signal so Gemini processes
+            # the buffered audio and responds immediately.
+            await self._session.send_realtime_input(
+                activity_end=types.ActivityEnd(),
+            )
+        except (AttributeError, TypeError):
+            # Older SDK: fall back to an explicit empty client content turn.
+            await self._session.send_client_content(
+                turns=types.Content(role="user", parts=[]),
+                turn_complete=True,
+            )
+
     # ------------------------------------------------------------------
     # Receiving output
     # ------------------------------------------------------------------
