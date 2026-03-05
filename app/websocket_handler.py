@@ -10,6 +10,7 @@ Message protocol
     {"type": "text", "content": "..."}
     {"type": "image_frame", "data": "<base64>"}
     {"type": "barge_in"}
+    {"type": "end_of_turn"}
 
 **Client → Backend (Binary)**::
 
@@ -45,13 +46,6 @@ from app.tools.search_tool import GoogleSearchGroundingParser
 
 logger = logging.getLogger(__name__)
 
-try:
-    from app.agents import AgentPipeline
-    _AGENTS_AVAILABLE = True
-except Exception:
-    _AGENTS_AVAILABLE = False
-    logger.warning("AgentPipeline not available — using fallback care summary")
-
 # ---------------------------------------------------------------------------
 # Safety keywords — if any appear in the model's text output the client UI
 # should highlight them (we tag the message so Flutter can style it).
@@ -82,7 +76,6 @@ async def _forward_gemini_to_client(
     gemini: GeminiLiveClient,
     ws: WebSocket,
     transcript_parts: list[str],
-    pipeline: Any | None = None,
 ) -> None:
     """Background task: read from Gemini and push to the Flutter client.
 
@@ -100,8 +93,6 @@ async def _forward_gemini_to_client(
             elif chunk_type == "text":
                 text = chunk["text"]
                 transcript_parts.append(text)
-                if pipeline is not None:
-                    pipeline.add_transcript("agent", text)
 
                 payload: dict[str, Any] = {
                     "type": "transcript",
@@ -130,8 +121,6 @@ async def _forward_gemini_to_client(
             elif chunk_type == "user_text":
                 text = chunk["text"]
                 transcript_parts.append("[User] " + text)
-                if pipeline is not None:
-                    pipeline.add_transcript("user", text)
                 await ws.send_json({
                     "type": "user_transcript",
                     "text": text,
@@ -152,8 +141,7 @@ async def _forward_gemini_to_client(
 
                 if tool_name in ["request_camera", "request_live_camera"]:
                     logger.info("Forwarding %s request to Flutter", tool_name)
-                    
-                    # Extract args safely (depends on genai SDK structure, usually it's a dict or object)
+
                     args = getattr(fn_call, "args", {})
                     if hasattr(args, "get"):
                         prompt = args.get("prompt", "Show me.")
@@ -161,35 +149,29 @@ async def _forward_gemini_to_client(
                     else:
                         prompt = getattr(args, "prompt", "Show me.")
                         duration = getattr(args, "duration_seconds", 10)
-                    
+
                     payload = {
                         "type": tool_name,
                         "prompt": prompt,
                     }
                     if tool_name == "request_live_camera":
                         payload["duration_seconds"] = duration
-                        
+
                     await ws.send_json(payload)
-                    
-                    # Respond to Gemini immediately so it can continue 
-                    # (it will wait for user to send the image frame later)
-                    from google.genai import types
+
+                    # Respond to Gemini so it can continue
                     await gemini.send_tool_response([
                         types.FunctionResponse(
                             name=tool_name,
                             id=getattr(fn_call, "id", ""),
-                            response={"result": "Request sent to user's device. Waiting for user to send image/video."},
+                            response={"result": "Request sent to user's device. Waiting for image."},
                         )
                     ])
                 else:
-                    # Notify Flutter that the agent is thinking (e.g. for Google Search)
                     await ws.send_json({
                         "type": "agent_thinking",
                         "tool": tool_name,
                     })
-
-                # Google Search grounding is handled automatically by the
-                # Live API — no manual tool response needed.
 
     except asyncio.CancelledError:
         logger.debug("Gemini forwarding task cancelled")
@@ -292,18 +274,13 @@ For severity: use "low" for minor cuts/burns/bruises, "medium" for moderate inju
 # ---------------------------------------------------------------------------
 
 async def handle_session(websocket: WebSocket) -> None:
-    """Handle a single MedLens session over WebSocket.
-
-    Called from the FastAPI route.  Manages the full lifecycle:
-    client connect → Gemini session → forwarding → cleanup.
-    """
+    """Handle a single MedLens session over WebSocket."""
     await websocket.accept()
     logger.info("Client WebSocket connected")
 
     gemini: GeminiLiveClient | None = None
     forward_task: asyncio.Task | None = None
     transcript_parts: list[str] = []
-    pipeline: "AgentPipeline | None" = None
 
     try:
         while True:
@@ -343,21 +320,14 @@ async def handle_session(websocket: WebSocket) -> None:
                     gemini = GeminiLiveClient(settings)
                     await gemini.connect()
                     transcript_parts.clear()
-                    if _AGENTS_AVAILABLE:
-                        pipeline = AgentPipeline()
 
-                    # Kick off background forwarding Gemini → Client
+                    # Start background task forwarding Gemini → Flutter
                     forward_task = asyncio.create_task(
-                        _forward_gemini_to_client(gemini, websocket, transcript_parts, pipeline)
+                        _forward_gemini_to_client(gemini, websocket, transcript_parts)
                     )
 
                     await websocket.send_json({"type": "session_started"})
                     logger.info("Gemini Live session started")
-
-                    # Trigger Dr. Muhammad's opening greeting.
-                    # The Live API waits for input before speaking — a single
-                    # dot is enough to prompt it to follow the system instruction.
-                    await gemini.trigger_greeting()
 
                 except Exception as exc:
                     logger.exception("Failed to start Gemini session")
@@ -365,6 +335,14 @@ async def handle_session(websocket: WebSocket) -> None:
                         {"type": "error", "message": f"Connection failed: {exc}"}
                     )
                     gemini = None
+                    continue
+
+                # Trigger greeting in a separate try so failures don't kill the session.
+                # The Live API won't speak first — we send a "." to prompt it.
+                try:
+                    await gemini.trigger_greeting()
+                except Exception:
+                    logger.warning("Greeting trigger failed — session still active", exc_info=True)
 
             # ── end_session ───────────────────────────────────────────────
             elif msg_type == "end_session":
@@ -383,7 +361,6 @@ async def handle_session(websocket: WebSocket) -> None:
                     gemini = None
 
                 forward_task = None
-                pipeline = None
                 transcript_parts.clear()
 
                 await websocket.send_json({"type": "session_ended"})
@@ -422,17 +399,15 @@ async def handle_session(websocket: WebSocket) -> None:
                     await gemini.send_barge_in()
 
             # ── end_of_turn ───────────────────────────────────────────────
-            # Sent by Flutter when the user taps the mic button to explicitly
-            # finish their turn (fallback for when Gemini VAD is slow).
+            # Sent by Flutter when the user taps mic to explicitly end their
+            # turn (fallback for when Gemini's VAD is slow).
             elif msg_type == "end_of_turn":
                 if gemini and gemini.is_connected:
                     await gemini.send_end_of_turn()
 
             # ── unknown ──────────────────────────────────────────────────
             else:
-                await websocket.send_json(
-                    {"type": "error", "message": f"Unknown message type: {msg_type}"}
-                )
+                logger.warning("Unknown message type: %s", msg_type)
 
     except WebSocketDisconnect:
         logger.info("Client WebSocket disconnected")
@@ -441,7 +416,6 @@ async def handle_session(websocket: WebSocket) -> None:
         logger.exception("Unexpected error in WebSocket handler")
 
     finally:
-        # ---- Cleanup --------------------------------------------------
         if forward_task and not forward_task.done():
             forward_task.cancel()
             try:

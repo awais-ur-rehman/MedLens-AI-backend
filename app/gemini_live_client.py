@@ -129,41 +129,38 @@ class GeminiLiveClient:
         )
 
     async def send_text(self, text: str) -> None:
-        """Send a text message as user content."""
+        """Send a text message via the realtime input channel.
+
+        Uses send_realtime_input (same channel as audio) to avoid mixing
+        API modes, which would break VAD-based audio turns.
+        """
         if not self._session:
             raise RuntimeError("Session not connected")
-        await self._session.send_client_content(
-            turns=types.Content(
-                role="user",
-                parts=[types.Part.from_text(text)],
-            ),
-            turn_complete=True,
+        await self._session.send_realtime_input(text=text)
+        await self._session.send_realtime_input(
+            activity_end=types.ActivityEnd(),
         )
 
     async def send_barge_in(self) -> None:
         """Interrupt the model's current response (barge-in)."""
         if not self._session:
             raise RuntimeError("Session not connected")
-        await self._session.send_client_content(
-            turns=types.Content(role="user", parts=[]),
-            turn_complete=True,
+        await self._session.send_realtime_input(
+            activity_end=types.ActivityEnd(),
         )
 
     async def trigger_greeting(self) -> None:
         """Send an initial trigger so Dr. Muhammad starts with a greeting.
 
         Gemini Live doesn't auto-speak on connect — it waits for input.
-        Sending a single dot gives it the turn it needs to follow the
-        system prompt instruction to introduce itself.
+        We use send_realtime_input (same channel as audio) to avoid mixing
+        API modes, which breaks the second user message.
         """
         if not self._session:
             raise RuntimeError("Session not connected")
-        await self._session.send_client_content(
-            turns=types.Content(
-                role="user",
-                parts=[types.Part.from_text(".")],
-            ),
-            turn_complete=True,
+        await self._session.send_realtime_input(text=".")
+        await self._session.send_realtime_input(
+            activity_end=types.ActivityEnd(),
         )
 
     async def send_end_of_turn(self) -> None:
@@ -175,18 +172,9 @@ class GeminiLiveClient:
         """
         if not self._session:
             raise RuntimeError("Session not connected")
-        try:
-            # Preferred: send an activity-end signal so Gemini processes
-            # the buffered audio and responds immediately.
-            await self._session.send_realtime_input(
-                activity_end=types.ActivityEnd(),
-            )
-        except (AttributeError, TypeError):
-            # Older SDK: fall back to an explicit empty client content turn.
-            await self._session.send_client_content(
-                turns=types.Content(role="user", parts=[]),
-                turn_complete=True,
-            )
+        await self._session.send_realtime_input(
+            activity_end=types.ActivityEnd(),
+        )
 
     # ------------------------------------------------------------------
     # Receiving output
