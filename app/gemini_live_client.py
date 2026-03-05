@@ -83,6 +83,15 @@ class GeminiLiveClient:
                 google_search=types.GoogleSearch(),
                 function_declarations=[request_camera_decl, request_live_camera_decl],
             )],
+            # Disable automatic VAD so we control turn boundaries explicitly.
+            # The client sends ActivityStart when the user begins speaking and
+            # ActivityEnd when they finish. This prevents the session from dying
+            # due to auto-VAD timing issues after the greeting turn completes.
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=True,
+                ),
+            ),
         )
 
         self._session_ctx = self._client.aio.live.connect(
@@ -141,8 +150,25 @@ class GeminiLiveClient:
             activity_end=types.ActivityEnd(),
         )
 
+    async def send_activity_start(self) -> None:
+        """Signal that the user has started speaking (manual VAD mode).
+
+        Must be called before streaming user audio so Gemini knows to start
+        processing it. Paired with send_end_of_turn (ActivityEnd) when done.
+        """
+        if not self._session:
+            raise RuntimeError("Session not connected")
+        logger.info("Sending ActivityStart — user started speaking")
+        await self._session.send_realtime_input(
+            activity_start=types.ActivityStart(),
+        )
+
     async def send_barge_in(self) -> None:
-        """Interrupt the model's current response (barge-in)."""
+        """Interrupt the model's current response (barge-in).
+
+        In manual VAD mode, ActivityEnd immediately signals Gemini to stop
+        generating. The user can then tap mic again to start a new turn.
+        """
         if not self._session:
             raise RuntimeError("Session not connected")
         await self._session.send_realtime_input(
@@ -154,24 +180,24 @@ class GeminiLiveClient:
 
         Gemini Live doesn't auto-speak on connect — it waits for input.
         We use send_realtime_input (same channel as audio) to avoid mixing
-        API modes, which breaks the second user message.
+        API modes, which breaks subsequent user messages.
+        Text input is processed immediately — no ActivityEnd needed.
         """
         if not self._session:
             raise RuntimeError("Session not connected")
+        logger.info("Triggering greeting via send_realtime_input(text='.')")
         await self._session.send_realtime_input(text=".")
-        await self._session.send_realtime_input(
-            activity_end=types.ActivityEnd(),
-        )
 
     async def send_end_of_turn(self) -> None:
-        """Signal that the user has finished speaking (manual VAD trigger).
+        """Signal that the user has finished speaking (manual VAD mode).
 
-        Used when the user taps the mic button to explicitly send their
-        message rather than waiting for Gemini's built-in VAD to detect
-        the end of speech.
+        Sends ActivityEnd to tell Gemini the user's turn is complete.
+        Gemini then processes the buffered audio and generates a response.
+        Only valid in manual VAD mode (automatic_activity_detection.disabled=True).
         """
         if not self._session:
             raise RuntimeError("Session not connected")
+        logger.info("Sending ActivityEnd — user finished speaking")
         await self._session.send_realtime_input(
             activity_end=types.ActivityEnd(),
         )
@@ -183,48 +209,62 @@ class GeminiLiveClient:
     async def receive_stream(self) -> AsyncGenerator[dict[str, Any], None]:
         """Async generator yielding response chunks from the model.
 
+        Loops over multiple turns. The SDK's session.receive() handles ONE turn
+        (up to turn_complete) then exits — we restart it so the session stays
+        alive for the full multi-turn conversation.
+
         Yields dicts with one of these shapes:
             {"type": "audio",     "data": bytes}
             {"type": "text",      "text": str}
+            {"type": "user_text", "text": str}
+            {"type": "turn_complete", "speaker": "agent"}
             {"type": "tool_call", "data": <function call object>}
         """
         if not self._session:
             raise RuntimeError("Session not connected")
 
-        async for message in self._session.receive():
-            # --- Audio chunk ---
-            if getattr(message, "data", None):
-                yield {"type": "audio", "data": message.data}
+        # CRITICAL: session.receive() ends after each turn_complete (by design).
+        # We wrap it in a while loop to keep reading across multiple turns.
+        while self._session:
+            async for message in self._session.receive():
+                # --- Audio chunk ---
+                raw_audio = getattr(message, "data", None)
+                if raw_audio:
+                    yield {"type": "audio", "data": raw_audio}
+                    # Don't access .text on audio messages — avoids SDK warning
+                    # about non-text parts. Fall through to check server_content.
+                else:
+                    # --- Text chunk (only for non-audio messages) ---
+                    if getattr(message, "text", None):
+                        yield {"type": "text", "text": message.text}
 
-            # --- Text chunk (if TEXT modality was used) ---
-            if getattr(message, "text", None):
-                yield {"type": "text", "text": message.text}
+                # Always check server_content regardless of audio presence.
+                server_content = getattr(message, "server_content", None)
+                if server_content:
+                    # --- Output Audio Transcription ---
+                    out_trans = getattr(server_content, "output_transcription", None)
+                    if out_trans and out_trans.text:
+                        yield {"type": "text", "text": out_trans.text}
 
-            server_content = getattr(message, "server_content", None)
-            if server_content:
-                # --- Output Audio Transcription (Text representation of voice) ---
-                out_trans = getattr(server_content, "output_transcription", None)
-                if out_trans and out_trans.text:
-                    yield {"type": "text", "text": out_trans.text}
+                    # --- Input Audio Transcription ---
+                    inp_trans = getattr(server_content, "input_transcription", None)
+                    if inp_trans and inp_trans.text:
+                        yield {"type": "user_text", "text": inp_trans.text}
 
-                # --- Input Audio Transcription (Optional: what the user said) ---
-                inp_trans = getattr(server_content, "input_transcription", None)
-                if inp_trans and inp_trans.text:
-                    # We can yield this as user_text if UI wants to show what was heard
-                    yield {"type": "user_text", "text": inp_trans.text}
+                    # --- Tool / function call ---
+                    model_turn = getattr(server_content, "model_turn", None)
+                    if model_turn and model_turn.parts:
+                        for part in model_turn.parts:
+                            fn_call = getattr(part, "function_call", None)
+                            if fn_call:
+                                yield {"type": "tool_call", "data": fn_call}
 
-                # --- Tool / function call ---
-                model_turn = getattr(server_content, "model_turn", None)
-                if model_turn and model_turn.parts:
-                    for part in model_turn.parts:
-                        fn_call = getattr(part, "function_call", None)
-                        if fn_call:
-                            yield {"type": "tool_call", "data": fn_call}
+                    # --- Turn Complete ---
+                    turn_complete = getattr(server_content, "turn_complete", None)
+                    if turn_complete:
+                        yield {"type": "turn_complete", "speaker": "agent"}
 
-                # --- Turn Complete ---
-                turn_complete = getattr(server_content, "turn_complete", None)
-                if turn_complete:
-                    yield {"type": "turn_complete", "speaker": "agent"}
+            logger.debug("Gemini turn ended — restarting receive() for next turn")
 
     # ------------------------------------------------------------------
     # Tool response

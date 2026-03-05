@@ -87,11 +87,13 @@ async def _forward_gemini_to_client(
 
             # ---- Audio → send as binary frame ------------------------------
             if chunk_type == "audio":
+                logger.debug("Gemini → audio %d bytes", len(chunk["data"]))
                 await ws.send_bytes(chunk["data"])
 
             # ---- Text → safety check, then send as JSON --------------------
             elif chunk_type == "text":
                 text = chunk["text"]
+                logger.info("Gemini → text: %s", text[:80])
                 transcript_parts.append(text)
 
                 payload: dict[str, Any] = {
@@ -120,6 +122,7 @@ async def _forward_gemini_to_client(
             # ---- User Text → send as JSON ----------------------------------
             elif chunk_type == "user_text":
                 text = chunk["text"]
+                logger.info("Gemini heard user: %s", text[:80])
                 transcript_parts.append("[User] " + text)
                 await ws.send_json({
                     "type": "user_transcript",
@@ -128,6 +131,7 @@ async def _forward_gemini_to_client(
 
             # ---- Turn Complete ---------------------------------------------
             elif chunk_type == "turn_complete":
+                logger.info("Gemini → turn_complete speaker=%s", chunk.get("speaker", "agent"))
                 await ws.send_json({
                     "type": "turn_complete",
                     "speaker": chunk.get("speaker", "agent")
@@ -256,14 +260,20 @@ For severity: use "low" for minor cuts/burns/bruises, "medium" for moderate inju
             project=settings.google_cloud_project,
             location=settings.google_cloud_location,
         )
-        response = await client.aio.models.generate_content(
-            model=settings.gemini_flash_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=settings.gemini_flash_model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
             ),
+            timeout=12.0,
         )
         return json.loads(response.text)
+    except asyncio.TimeoutError:
+        logger.warning("Care summary generation timed out — using fallback")
+        return _build_care_summary_fallback(transcript_parts)
     except Exception:
         logger.exception("Gemini Flash care summary failed — using fallback")
         return _build_care_summary_fallback(transcript_parts)
@@ -290,7 +300,17 @@ async def handle_session(websocket: WebSocket) -> None:
             if "bytes" in message and message["bytes"]:
                 pcm_data: bytes = message["bytes"]
                 if gemini and gemini.is_connected:
-                    await gemini.send_audio(pcm_data)
+                    try:
+                        await gemini.send_audio(pcm_data)
+                    except Exception:
+                        logger.exception("Gemini connection lost while sending audio")
+                        gemini._session = None  # Mark as disconnected
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Connection to AI lost. Please end and restart the session.",
+                        })
+                else:
+                    logger.warning("Audio received but no active Gemini session")
                 continue
 
             # ---- Text frame → JSON control message -----------------------
@@ -393,17 +413,28 @@ async def handle_session(websocket: WebSocket) -> None:
                         {"type": "error", "message": "No active session"}
                     )
 
+            # ── activity_start ────────────────────────────────────────────
+            # Sent when user taps mic to begin speaking (manual VAD mode).
+            elif msg_type == "activity_start":
+                logger.info("Client sent activity_start — forwarding ActivityStart to Gemini")
+                if gemini and gemini.is_connected:
+                    await gemini.send_activity_start()
+                else:
+                    logger.warning("activity_start received but no active Gemini session")
+
             # ── barge_in ──────────────────────────────────────────────────
             elif msg_type == "barge_in":
                 if gemini and gemini.is_connected:
                     await gemini.send_barge_in()
 
             # ── end_of_turn ───────────────────────────────────────────────
-            # Sent by Flutter when the user taps mic to explicitly end their
-            # turn (fallback for when Gemini's VAD is slow).
+            # Sent by Flutter when the user taps mic to stop speaking.
             elif msg_type == "end_of_turn":
+                logger.info("Client sent end_of_turn — forwarding ActivityEnd to Gemini")
                 if gemini and gemini.is_connected:
                     await gemini.send_end_of_turn()
+                else:
+                    logger.warning("end_of_turn received but no active Gemini session")
 
             # ── unknown ──────────────────────────────────────────────────
             else:
