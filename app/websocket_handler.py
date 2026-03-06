@@ -32,6 +32,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -50,6 +51,11 @@ logger = logging.getLogger(__name__)
 # Safety keywords — if any appear in the model's text output the client UI
 # should highlight them (we tag the message so Flutter can style it).
 # ---------------------------------------------------------------------------
+# Regex to extract [[OVERLAY:{...}]] annotations from Dr. Muhammad's text.
+# The annotation is stripped from the transcript sent to Flutter so users
+# don't see the raw JSON tag in the chat bubble.
+_OVERLAY_RE = re.compile(r'\[\[OVERLAY:(\{.*?\})\]\]', re.DOTALL)
+
 _ESCALATION_KEYWORDS = frozenset(
     [
         "call emergency",
@@ -94,16 +100,31 @@ async def _forward_gemini_to_client(
             elif chunk_type == "text":
                 text = chunk["text"]
                 logger.info("Gemini → text: %s", text[:80])
-                transcript_parts.append(text)
 
-                payload: dict[str, Any] = {
-                    "type": "transcript",
-                    "text": text,
-                }
-                if _check_escalation(text):
-                    payload["escalation"] = True
+                # Extract [[OVERLAY:{...}]] annotations and strip them from
+                # the visible transcript so users don't see raw JSON tags.
+                overlay_matches = _OVERLAY_RE.findall(text)
+                clean_text = _OVERLAY_RE.sub("", text).strip()
 
-                await ws.send_json(payload)
+                if clean_text:
+                    transcript_parts.append(clean_text)
+                    payload: dict[str, Any] = {
+                        "type": "transcript",
+                        "text": clean_text,
+                    }
+                    if _check_escalation(clean_text):
+                        payload["escalation"] = True
+                    await ws.send_json(payload)
+
+                # Send each overlay as a separate JSON message so Flutter
+                # can render the OverlayPainter on the camera preview.
+                for overlay_str in overlay_matches:
+                    try:
+                        overlay_data = json.loads(overlay_str)
+                        await ws.send_json({"type": "overlay", "data": overlay_data})
+                        logger.info("Sent overlay annotation: %s", overlay_str[:120])
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse overlay JSON: %s", overlay_str)
 
                 # -- Forward Google Search grounding citations ---------------
                 grounding_meta = chunk.get("grounding_metadata")
