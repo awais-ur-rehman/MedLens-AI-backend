@@ -184,7 +184,7 @@ docker run -p 8080:8080 --env-file .env medlens-backend
 ### Cloud Run (deployed)
 
 ```
-wss://medlens-backend-nw7kauj2aa-uc.a.run.app
+wss://medlens-backend-854906476206.us-central1.run.app
 ```
 
 ## API Endpoints
